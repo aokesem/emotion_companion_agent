@@ -1,0 +1,8 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "mental_comfort_assistant": "./main_1.py:app"
+  },
+  "env": ".env",
+  "python_version": "3.11"
+}
