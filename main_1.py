@@ -11,6 +11,9 @@ from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, END
 from supabase import create_client, Client
 
+os.environ['HTTP_PROXY'] = "http://127.0.0.1:7897" #不要删除这两行
+os.environ['HTTPS_PROXY'] = "http://127.0.0.1:7897"
+
 # 加载环境变量
 load_dotenv()
 
@@ -443,15 +446,35 @@ def memory_writer_node(state: AgentState):
         "ai_text": last_ai,
         "embed_text": embed_text,
         "emotion_label": state["emotion_data"].get("inferred_emotion", "未知"),
+        "emotion_data_json": state.get("emotion_data", {}),
         "intensity": state["emotion_data"].get("intensity", "低"),
         "openness": state.get("openness", 0.3),
+        "strategy_pack_json": state.get("strategy_pack", {}),
+        "rag_hit_count": len(state.get("candidate_memories", []) or []),
+        "memory_used": bool(state.get("strategy_pack", {}).get("memory_allowed", False)),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     try:
         supabase.table("conversation_turns").insert(conv_payload).execute()
     except Exception as e:
-        print(f"[6A-1 conversation_turns 写入失败] {e}")
-        return {"user_profile": current_profile}
+        # 兼容旧表结构：若新增列尚未迁移，回退到基础字段写入
+        fallback = {
+            "user_id": uid,
+            "session_id": sid,
+            "user_text": last_user,
+            "ai_text": last_ai,
+            "embed_text": embed_text,
+            "emotion_label": state["emotion_data"].get("inferred_emotion", "未知"),
+            "intensity": state["emotion_data"].get("intensity", "低"),
+            "openness": state.get("openness", 0.3),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            supabase.table("conversation_turns").insert(fallback).execute()
+            print(f"[6A-1] 使用基础字段回退写入: {e}")
+        except Exception as e2:
+            print(f"[6A-1 conversation_turns 写入失败] {e2}")
+            return {"user_profile": current_profile}
     try:
         q = (
             supabase.table("conversation_turns")

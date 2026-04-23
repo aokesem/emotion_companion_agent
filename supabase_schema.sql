@@ -18,6 +18,10 @@ create index if not exists idx_chat_sessions_user_time
 -- alter table public.conversation_turns add column if not exists session_id uuid;
 -- alter table public.conversation_turns add column if not exists embed_text text;
 -- alter table public.conversation_turns add column if not exists embedding vector(1536);
+-- alter table public.conversation_turns add column if not exists emotion_data_json jsonb;
+-- alter table public.conversation_turns add column if not exists strategy_pack_json jsonb;
+-- alter table public.conversation_turns add column if not exists rag_hit_count int;
+-- alter table public.conversation_turns add column if not exists memory_used boolean;
 -- 再补外键/非空/索引与 RPC，见项目 Supabase 控制台已执行的脚本。
 
 -- 4) 用户画像
