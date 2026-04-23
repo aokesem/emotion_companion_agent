@@ -1,17 +1,15 @@
 import copy
 import json
 import os
+import uuid
 from datetime import datetime, timezone
 from typing import Annotated, TypedDict, List, Dict, Any, Optional
-from dotenv import load_dotenv
 
-from langchain_openai import ChatOpenAI
+from dotenv import load_dotenv
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, END
 from supabase import create_client, Client
-
-os.environ['HTTP_PROXY'] = "http://127.0.0.1:7897"
-os.environ['HTTPS_PROXY'] = "http://127.0.0.1:7897"
 
 # 加载环境变量
 load_dotenv()
@@ -25,6 +23,7 @@ class AgentState(TypedDict):
     candidate_memories: List[Dict[str, Any]]  # 检索到的历史片段
     strategy_pack: Dict[str, Any]  # 本轮策略
     user_id: str
+    session_id: str  # 当前会话（chat_sessions.id，UUID 字符串）
     user_profile: Dict[str, Any]  # 用户角色画像（与 user_profiles.profile JSON 对齐）
 
 
@@ -130,6 +129,26 @@ supabase: Client | None = None
 if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+_embeddings: Optional[OpenAIEmbeddings] = None
+
+
+def _get_embeddings() -> Optional[OpenAIEmbeddings]:
+    """智谱等 OpenAI 兼容 embedding（维度与 DB vector(1536) 一致）。"""
+    global _embeddings
+    if _embeddings is not None:
+        return _embeddings
+    base = os.getenv("EMBEDDING_BASE_URL")
+    key = os.getenv("EMBEDDING_API_KEY")
+    if not base or not key:
+        return None
+    _embeddings = OpenAIEmbeddings(
+        model=os.getenv("EMBEDDING_MODEL", "embedding-3"),
+        openai_api_base=base,
+        openai_api_key=key,
+        dimensions=int(os.getenv("EMBEDDING_DIMS", "1536")),
+    )
+    return _embeddings
+
 
 def _safe_json_parse(raw_text: str) -> Dict[str, Any]:
     try:
@@ -141,6 +160,36 @@ def _safe_json_parse(raw_text: str) -> Dict[str, Any]:
 
 def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
     return max(low, min(high, value))
+
+
+def ensure_session_node(state: AgentState):
+    """入口：为当前 run 准备 session_id；无则向 chat_sessions 新建一行。"""
+    existing = (state.get("session_id") or "").strip()
+    if existing:
+        return {}
+    uid = state["user_id"]
+    if not supabase:
+        return {"session_id": str(uuid.uuid4())}
+    try:
+        supabase.table("chat_sessions").insert(
+            {
+                "user_id": uid,
+                "title": os.getenv("DEFAULT_SESSION_TITLE", "新会话"),
+            }
+        ).execute()
+        got = (
+            supabase.table("chat_sessions")
+            .select("id")
+            .eq("user_id", uid)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if got.data:
+            return {"session_id": str(got.data[0]["id"])}
+    except Exception as e:
+        print(f"[ensure_session] 创建/读取 chat_sessions 失败: {e}")
+    return {"session_id": str(uuid.uuid4())}
 
 
 def load_profile_node(state: AgentState):
@@ -218,21 +267,49 @@ def openness_tracker_node(state: AgentState):
 
 
 def memory_retrieval_node(state: AgentState):
-    """模块③：记忆检索（Supabase Top3）。"""
+    """模块③：本会话内向量检索，失败时回退为按时间取最近 N 条。"""
     if not supabase:
         return {"candidate_memories": []}
+    sid = (state.get("session_id") or "").strip()
+    uid = state["user_id"]
+    if not sid:
+        return {"candidate_memories": []}
+    last_user = state["messages"][-1].content if state.get("messages") else ""
+    match_count = int(os.getenv("RAG_MATCH_COUNT", "5"))
+    emb = _get_embeddings()
+    if emb and last_user:
+        try:
+            query_vec = emb.embed_query(last_user)
+            r = supabase.rpc(
+                "match_conversation_turns",
+                {
+                    "query_embedding": query_vec,
+                    "match_count": match_count,
+                    "p_user_id": uid,
+                    "p_session_id": sid,
+                },
+            ).execute()
+            if r.data is not None:
+                rows: List[Dict[str, Any]] = (
+                    list(r.data) if isinstance(r.data, list) else []
+                )
+                if rows:
+                    return {"candidate_memories": rows}
+        except Exception as e:
+            print(f"[memory_retrieval] 向量/RPC 失败: {e}")
     try:
         resp = (
             supabase.table("conversation_turns")
-            .select("user_text,emotion_label,intensity,created_at")
-            .eq("user_id", state["user_id"])
+            .select("user_text,ai_text,emotion_label,intensity,created_at")
+            .eq("user_id", uid)
+            .eq("session_id", sid)
             .order("created_at", desc=True)
             .limit(3)
             .execute()
         )
         return {"candidate_memories": resp.data or []}
     except Exception as e:
-        print(f"[memory_retrieval] {e}")
+        print(f"[memory_retrieval] 回退时间序失败: {e}")
         return {"candidate_memories": []}
 
 
@@ -274,7 +351,9 @@ def generation_node(state: AgentState):
     memory_allowed = strategy.get("memory_allowed", False)
     memory_text = ""
     if memory_allowed:
-        memory_text = f"可引用历史记忆（最多1条，软过渡）：{state.get('candidate_memories', [])[:1]}"
+        mem = state.get("candidate_memories", []) or []
+        top = mem[0] if mem else None
+        memory_text = f"可引用本会话内相关记忆（最多1条，软过渡）：{top}"
 
     profile = state.get("user_profile") or _default_user_profile()
     profile_json = json.dumps(profile, ensure_ascii=False, indent=2)
@@ -345,32 +424,65 @@ def memory_writer_node(state: AgentState):
     last_user = state["messages"][-2].content if len(state["messages"]) >= 2 else ""
     last_ai = state["messages"][-1].content if state["messages"] else ""
     uid = state["user_id"]
+    sid = (state.get("session_id") or "").strip()
     if not last_user or not last_ai:
         print("[memory_writer] 消息不完整，跳过写入。")
         return {"user_profile": current_profile}
+    if not sid:
+        print("[memory_writer] 无 session_id，跳过 conversation / 画像落库。")
+        return {"user_profile": current_profile}
 
-    # --- 6A-1: 写入 conversation_turns，并尽量取得 turn id ---
+    embed_text = f"用户：{last_user}\n助手：{last_ai}"
+
+    # --- 6A-1: 写入 conversation_turns（向量化在写入后通过 update 回写）---
     turn_id: Optional[int] = None
-    conv_payload = {
+    conv_payload: Dict[str, Any] = {
         "user_id": uid,
+        "session_id": sid,
         "user_text": last_user,
         "ai_text": last_ai,
+        "embed_text": embed_text,
         "emotion_label": state["emotion_data"].get("inferred_emotion", "未知"),
         "intensity": state["emotion_data"].get("intensity", "低"),
         "openness": state.get("openness", 0.3),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     try:
-        ins = (
-            supabase.table("conversation_turns")
-            .insert(conv_payload)
-            .execute()
-        )
-        if ins.data:
-            turn_id = ins.data[0].get("id")
+        supabase.table("conversation_turns").insert(conv_payload).execute()
     except Exception as e:
         print(f"[6A-1 conversation_turns 写入失败] {e}")
         return {"user_profile": current_profile}
+    try:
+        q = (
+            supabase.table("conversation_turns")
+            .select("id")
+            .eq("user_id", uid)
+            .eq("session_id", sid)
+            .order("id", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if q.data:
+            turn_id = q.data[0].get("id")
+    except Exception as e:
+        print(f"[6A-1 取 turn id 失败] {e}")
+
+    # 6A-1b: 对 embed_text 生成向量并回写本行
+    efn = _get_embeddings()
+    if efn and turn_id is not None:
+        try:
+            vec = efn.embed_query(embed_text)
+            supabase.table("conversation_turns").update(
+                {"embedding": vec}
+            ).eq("id", turn_id).execute()
+        except Exception as e:
+            print(f"[6A-1b 向量回写失败] {e}")
+    try:
+        supabase.table("chat_sessions").update(
+            {"last_message_at": datetime.now(timezone.utc).isoformat()}
+        ).eq("id", sid).execute()
+    except Exception as e:
+        print(f"[chat_sessions 更新时间] {e}")
 
     # --- 6A-2: LLM 提取画像 patch ---
     patch: Dict[str, Any] = {}
@@ -407,6 +519,7 @@ def memory_writer_node(state: AgentState):
 
 
 workflow = StateGraph(AgentState)
+workflow.add_node("ensure_session", ensure_session_node)
 workflow.add_node("load_profile", load_profile_node)
 workflow.add_node("decoder", emotion_decoder_node)
 workflow.add_node("openness_tracker", openness_tracker_node)
@@ -415,7 +528,8 @@ workflow.add_node("strategy_controller", strategy_controller_node)
 workflow.add_node("generator", generation_node)
 workflow.add_node("memory_writer", memory_writer_node)
 
-workflow.set_entry_point("load_profile")
+workflow.set_entry_point("ensure_session")
+workflow.add_edge("ensure_session", "load_profile")
 workflow.add_edge("load_profile", "decoder")
 workflow.add_edge("decoder", "openness_tracker")
 workflow.add_edge("openness_tracker", "memory_retrieval")
@@ -435,6 +549,7 @@ if __name__ == "__main__":
         "candidate_memories": [],
         "strategy_pack": {},
         "user_id": os.getenv("DEFAULT_USER_ID", "demo_user"),
+        "session_id": os.getenv("DEFAULT_SESSION_ID", "").strip(),
         "user_profile": _default_user_profile(),
     }
 

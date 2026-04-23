@@ -1,21 +1,13 @@
-import requests
+from langchain_openai import OpenAIEmbeddings
+import os
+os.environ['HTTP_PROXY'] = "http://127.0.0.1:7897"
+os.environ['HTTPS_PROXY'] = "http://127.0.0.1:7897"
+embeddings = OpenAIEmbeddings(
+    model="embedding-3",
+    base_url="https://open.bigmodel.cn/api/paas/v4",
+    api_key="2603860153fd484ead5ff4e05791e05f.J1X7dyCEFjtKuFfS",
+    dimensions=1536
+)
 
-url = "https://dpapi.cn/v1/chat/completions"
-headers = {
-    "Authorization": "sk-uBhYPi9uqJgsRvVF32F7A4B8960841618b1b248eD6195c46",
-    "Content-Type": "application/json"
-}
-data = {
-    "model": "deepseek-chat",
-    "messages": [{"role": "user", "content": "你好，你是谁"}],
-}
-
-response = requests.post(url, headers=headers, json=data)
-
-if response.status_code != 200:
-    raise Exception(f"Error: {response.status_code}, {response.json()}")
-json_data = response.json()
-content = json_data["choices"][0]["message"]["content"]
-
-
-print("响应结果：", content)
+vector = embeddings.embed_query("我感觉有点累，精神很疲惫")
+print(len(vector))  
