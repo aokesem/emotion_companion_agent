@@ -7,7 +7,7 @@ from typing import Annotated, TypedDict, List, Dict, Any, Optional
 
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage
 from langgraph.graph import StateGraph, END
 from supabase import create_client, Client
 
@@ -134,6 +134,18 @@ if SUPABASE_URL and SUPABASE_KEY:
 
 _embeddings: Optional[OpenAIEmbeddings] = None
 
+EMOTION_LABEL_SET = {
+    "孤独",
+    "怀旧",
+    "防御",
+    "焦虑",
+    "悲伤",
+    "平静",
+    "压抑",
+    "被需要感",
+    "无明显情感",
+}
+
 
 def _get_embeddings() -> Optional[OpenAIEmbeddings]:
     """智谱等 OpenAI 兼容 embedding（维度与 DB vector(1536) 一致）。"""
@@ -163,6 +175,108 @@ def _safe_json_parse(raw_text: str) -> Dict[str, Any]:
 
 def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
     return max(low, min(high, value))
+
+
+def _build_role_labeled_context(messages: List[BaseMessage], keep_last: int = 6) -> List[Dict[str, str]]:
+    """将最近上下文转换为带角色标签的结构，供模块①使用。"""
+    ctx: List[Dict[str, str]] = []
+    for msg in messages[-keep_last:]:
+        if isinstance(msg, HumanMessage):
+            role = "user"
+        elif isinstance(msg, AIMessage):
+            role = "assistant"
+        else:
+            role = "system"
+        ctx.append({"role": role, "text": str(msg.content)})
+    return ctx
+
+
+def _get_profile_for_decoder(user_profile: Dict[str, Any]) -> Dict[str, Any]:
+    """只抽取对情感解码有帮助的画像片段，避免噪声过大。"""
+    p = _ensure_profile_shape(user_profile or {})
+    return {
+        "age": p.get("age"),
+        "health": p.get("health", {}).get("summary"),
+        "family_social": p.get("family_social", {}).get("summary"),
+        "hobbies": p.get("hobbies", {}).get("summary"),
+        "personality": p.get("personality", {}).get("summary"),
+        "habits": p.get("habits", {}).get("summary"),
+    }
+
+
+def _get_high_freq_emotions(user_id: str) -> List[Dict[str, Any]]:
+    """历史高频情感：仅统计 confidence 为中/高的记录。"""
+    if not supabase:
+        return []
+    try:
+        resp = (
+            supabase.table("conversation_turns")
+            .select("emotion_data_json")
+            .eq("user_id", user_id)
+            .order("id", desc=True)
+            .limit(500)
+            .execute()
+        )
+        rows = resp.data or []
+    except Exception as e:
+        print(f"[decoder] 高频情感检索失败: {e}")
+        return []
+
+    counts: Dict[str, int] = {}
+    total_valid = 0
+    for row in rows:
+        info = row.get("emotion_data_json") if isinstance(row, dict) else None
+        if isinstance(info, str):
+            info = _safe_json_parse(info)
+        if not isinstance(info, dict):
+            continue
+        conf = str(info.get("confidence", "")).strip()
+        emo = str(info.get("inferred_emotion", "")).strip()
+        if conf not in ("中", "高"):
+            continue
+        if emo not in EMOTION_LABEL_SET:
+            continue
+        total_valid += 1
+        counts[emo] = counts.get(emo, 0) + 1
+
+    if total_valid <= 0:
+        return []
+    # 冷启动与成熟期采用不同阈值，避免早期完全无可用信号
+    if total_valid < 20:
+        min_count, min_ratio = 3, 0.30
+    else:
+        min_count, min_ratio = 10, 0.25
+
+    out: List[Dict[str, Any]] = []
+    for emo, cnt in counts.items():
+        ratio = cnt / total_valid
+        if cnt >= min_count and ratio >= min_ratio:
+            out.append({"emotion": emo, "count": cnt, "ratio": round(ratio, 3)})
+    out.sort(key=lambda x: (-x["count"], -x["ratio"]))
+    return out
+
+
+def _normalize_emotion_info(raw: Dict[str, Any], last_message: str) -> Dict[str, Any]:
+    """字段级容错：解析成功但字段缺失时逐项补默认并校验枚举。"""
+    info = raw if isinstance(raw, dict) else {}
+    surface = str(info.get("surface_content", "")).strip() or last_message
+    hidden = str(info.get("hidden_subtext", "")).strip() or "未能稳定推断潜台词"
+    inferred = str(info.get("inferred_emotion", "")).strip()
+    if inferred not in EMOTION_LABEL_SET:
+        inferred = "无明显情感"
+    confidence = str(info.get("confidence", "")).strip()
+    if confidence not in ("高", "中", "低"):
+        confidence = "低"
+    intensity = str(info.get("intensity", "")).strip()
+    if intensity not in ("低", "中", "高"):
+        intensity = "低"
+    return {
+        "surface_content": surface,
+        "hidden_subtext": hidden,
+        "inferred_emotion": inferred,
+        "confidence": confidence,
+        "intensity": intensity,
+    }
 
 
 def ensure_session_node(state: AgentState):
@@ -219,31 +333,37 @@ def load_profile_node(state: AgentState):
 def emotion_decoder_node(state: AgentState):
     """模块①：隐性情感解码器。"""
     last_message = state["messages"][-1].content
-    recent_context = [m.content for m in state["messages"][-4:-1]]
+    recent_context = _build_role_labeled_context(state["messages"][:-1], keep_last=6)
+    profile_for_decoder = _get_profile_for_decoder(state.get("user_profile", {}))
+    high_freq_emotions = _get_high_freq_emotions(state["user_id"])
 
     prompt = f"""
-你是情感解码器。根据用户当前发言和最近上下文，输出严格JSON：
-{{
-  "surface_content": "表层意思",
-  "inferred_emotion": "如孤独/怀旧/防御",
-  "confidence": "高/中/低",
-  "intensity": "低/中/高",
-  "recommended_tone": "试探性共情/温和倾听/稳定陪伴"
-}}
-最近上下文: {recent_context}
-用户原始文本: "{last_message}"
-只输出JSON，不要额外说明。
+    你是情感解码器，服务对象是独居，缺乏社交，情感表达能力较差的中老年人。你的核心任务不是简单分类情感，
+    而是先判断这句话的潜台词，再给出情感结论。
+
+    你可在内部进行推断，但不要输出推理过程，只输出最终JSON。
+    情感标签必须从以下集合中选择一个：
+    ["孤独","怀旧","防御","焦虑","悲伤","平静","压抑","被需要感","无明显情感"]
+
+    请输出严格JSON：
+    {{
+    "surface_content": "表层意思",
+    "hidden_subtext": "推断的用户潜台词（一句话）",
+    "inferred_emotion": "判断的用户情感类型，从情感标签集合中选择一个",
+    "confidence": "判断的用户情感的置信度，从高/中/低中选择一个",
+    "intensity": "判断的用户情感的强度，从低/中/高中选择一个"
+    }}
+
+    若最近上下文为空，则仅根据当前发言判断，不要臆造历史。
+
+    最近上下文(带角色): {recent_context}
+    用户画像(情感解码相关片段): {profile_for_decoder}
+    历史高频情感(仅中/高置信统计结果，可能为空): {high_freq_emotions}
+    用户原始文本: "{last_message}"
+    只输出JSON，不要额外说明。
     """
     response = llm.invoke([HumanMessage(content=prompt)])
-    emotion_info = _safe_json_parse(response.content)
-    if not emotion_info:
-        emotion_info = {
-            "surface_content": last_message,
-            "inferred_emotion": "未知",
-            "confidence": "低",
-            "intensity": "低",
-            "recommended_tone": "试探性共情",
-        }
+    emotion_info = _normalize_emotion_info(_safe_json_parse(response.content), last_message)
     print(
         f"--- 情感分析结果: {emotion_info['inferred_emotion']} ({emotion_info['intensity']}) ---"
     )
@@ -332,18 +452,26 @@ def strategy_controller_node(state: AgentState):
     elif "过去" in state["messages"][-1].content and openness > 0.5:
         therapy = "reminiscence"
         posture = "软过渡延伸"
-    elif inferred == "存在性焦虑" and intensity == "高":
+    elif inferred == "焦虑" and intensity == "高":
         therapy = "logotherapy"
         posture = "陪伴倾听"
     else:
         therapy = "default"
         posture = "软过渡延伸"
 
+    # 语气由策略控制器统一决策，不再由模块①直接给出。
+    if confidence == "低":
+        tone = "试探性共情"
+    elif intensity == "高" and inferred in ("孤独", "悲伤", "焦虑", "压抑"):
+        tone = "稳定陪伴"
+    else:
+        tone = "温和倾听"
+
     strategy_pack = {
         "therapy": therapy,
         "posture": posture,
         "memory_allowed": memory_allowed,
-        "tone": state.get("emotion_data", {}).get("recommended_tone", "温和倾听"),
+        "tone": tone,
     }
     return {"strategy_pack": strategy_pack}
 
